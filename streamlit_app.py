@@ -196,175 +196,25 @@ def calc_module_scores(dm,om,fl,bl,ps,diag):
     data={"Demand Forecasting":min(100,round(dm["accuracy"]*0.7+max(0,20-abs(dm["bias"]))*1.5)),"Order Management":max(0,min(100,round(100-om["err"]*5-om["disp"]*3-om["amend"]*0.5))),"Order Fulfilment & Logistics":max(0,min(100,round(fl["otif"]*0.8+max(0,10-fl["return_rate"])*2))),"Billing & Revenue Mgmt":max(0,min(100,round(100-bl["err"]*8-bl["disp"]*4))),"Post-Sales & Financial Closure":ps["score"]}
     return {m:round(data[m]*0.6+diag.get(m,50)*0.4) for m in data}
 
-def calc_customer_ltv(df, industry):
-    """Customer LTV Engine: combines revenue, margin, payment behaviour, dispute rate, tenure into LTV score."""
-    cust = df.groupby("Customer").agg(
-        total_revenue=("Invoice_Amount_USD", "sum"),
-        order_count=("Order_ID", "count"),
-        avg_dso=("DSO_Days", "mean"),
-        dispute_rate=("Disputed", lambda x: x.mean() * 100 if "Disputed" in df.columns else 0),
-        return_rate=("Return_Flag", lambda x: x.mean() * 100 if "Return_Flag" in df.columns else 0),
-        avg_order_value=("Invoice_Amount_USD", "mean"),
-        deductions=("Deduction_USD", "sum") if "Deduction_USD" in df.columns else ("Invoice_Amount_USD", lambda x: 0),
-    ).reset_index()
-    bench_dso = INDUSTRIES[industry]["dso_benchmark"]
-    if "Order_Date" in df.columns and "Payment_Date" in df.columns:
-        tenure = df.groupby("Customer").apply(lambda g: (pd.to_datetime(g["Payment_Date"]).max() - pd.to_datetime(g["Order_Date"]).min()).days).reset_index()
-        tenure.columns = ["Customer", "tenure_days"]
-        cust = cust.merge(tenure, on="Customer", how="left")
-    else:
-        cust["tenure_days"] = 365
-    cust["tenure_months"] = (cust["tenure_days"] / 30).clip(lower=1).round(0).astype(int)
-    cust["monthly_revenue"] = cust["total_revenue"] / cust["tenure_months"]
-    cust["est_gross_margin"] = cust["total_revenue"] * 0.35
-    cust["cost_to_serve"] = (cust["deductions"] + cust["total_revenue"] * (cust["dispute_rate"] / 100) * 0.05 + cust["total_revenue"] * (cust["return_rate"] / 100) * 0.15)
-    cust["net_margin"] = cust["est_gross_margin"] - cust["cost_to_serve"]
-    cust["net_margin_pct"] = (cust["net_margin"] / cust["total_revenue"].replace(0, np.nan) * 100).round(1)
-    dso_score = (100 - ((cust["avg_dso"] - bench_dso).clip(lower=0) / bench_dso * 60)).clip(0, 100)
-    dispute_score = (100 - cust["dispute_rate"] * 12).clip(0, 100)
-    frequency_score = (cust["order_count"] / cust["order_count"].max() * 100).clip(0, 100)
-    revenue_score = (cust["total_revenue"] / cust["total_revenue"].max() * 100).clip(0, 100)
-    cust["health_score"] = (revenue_score * 0.15 + frequency_score * 0.15 + dso_score * 0.40 + dispute_score * 0.30).round(0).astype(int)
-    # Hard penalty: if DSO > 2x benchmark or dispute > 15%, cap health at 35
-    cust.loc[cust["avg_dso"] > bench_dso * 1.8, "health_score"] = cust.loc[cust["avg_dso"] > bench_dso * 1.8, "health_score"].clip(upper=35)
-    cust.loc[cust["dispute_rate"] > 12, "health_score"] = cust.loc[cust["dispute_rate"] > 12, "health_score"].clip(upper=35)
-    cust["ltv_12m"] = (cust["monthly_revenue"] * 12 * 0.35 - cust["cost_to_serve"] / cust["tenure_months"] * 12).round(0)
-    cust["churn_risk"] = cust["health_score"].apply(lambda x: "High" if x < 40 else "Medium" if x < 65 else "Low")
-    def assign_segment(r):
-        if r["health_score"] < 40: return "Monitor"
-        if r["health_score"] < 55: return "At Risk"
-        if r["ltv_12m"] > cust["ltv_12m"].quantile(0.75) and r["health_score"] >= 65: return "Strategic"
-        if r["health_score"] >= 60: return "Growth"
-        return "At Risk"
-    cust["segment"] = cust.apply(assign_segment, axis=1)
-    return cust.sort_values("ltv_12m", ascending=False).round(1)
+# calc_customer_ltv: removed — not used in ForecastIQ demo
 
-def calc_cash_app_simulation(df):
-    """Auto Cash Application simulation: matches payments to invoices using amount, identity, and pattern."""
-    if "Invoice_Amount_USD" not in df.columns or "Customer" not in df.columns:
-        return {"match_rate": 0, "auto_matched": 0, "manual_review": 0, "unmatched": 0, "items": []}
-    np.random.seed(42)
-    n = min(len(df), 30)
-    sample = df.sample(n=n, random_state=42).copy()
-    sample["Remittance_Amount"] = sample["Invoice_Amount_USD"] * np.random.choice([1.0, 1.0, 1.0, 0.98, 0.95, 1.02], n)
-    sample["Remittance_Amount"] = sample["Remittance_Amount"].round(2)
-    sample["Amount_Match"] = (abs(sample["Invoice_Amount_USD"] - sample["Remittance_Amount"]) / sample["Invoice_Amount_USD"] < 0.03)
-    sample["Identity_Match"] = np.random.choice([True, True, True, True, False], n)
-    sample["Pattern_Match"] = np.random.choice([True, True, True, False, False], n)
-    sample["Confidence"] = (sample["Amount_Match"].astype(int) * 45 + sample["Identity_Match"].astype(int) * 35 + sample["Pattern_Match"].astype(int) * 20)
-    sample["Match_Status"] = sample["Confidence"].apply(lambda c: "Auto-Matched" if c >= 80 else "Review Required" if c >= 45 else "Unmatched")
-    sample["Match_Method"] = sample.apply(lambda r: "Amount + Identity + Pattern" if r["Confidence"] >= 80 else "Partial match — " + (", ".join(filter(None, ["amount" if r["Amount_Match"] else None, "identity" if r["Identity_Match"] else None, "pattern" if r["Pattern_Match"] else None])) or "no signal"), axis=1)
-    auto = (sample["Match_Status"] == "Auto-Matched").sum()
-    review = (sample["Match_Status"] == "Review Required").sum()
-    unmatched = (sample["Match_Status"] == "Unmatched").sum()
-    items = sample[["Order_ID", "Customer", "Invoice_Amount_USD", "Remittance_Amount", "Confidence", "Match_Status", "Match_Method"]].to_dict("records")
-    return {"match_rate": round(auto / max(n, 1) * 100, 1), "auto_matched": int(auto), "manual_review": int(review), "unmatched": int(unmatched), "total": int(n), "items": items}
+# calc_cash_app_simulation: removed — not used in ForecastIQ demo
 
-def calc_dispute_workflow(df):
-    """CollectIQ Dispute Engine simulation: categorises, routes, and recommends resolution."""
-    if "Disputed" not in df.columns:
-        return {"total": 0, "categories": {}, "items": []}
-    disputed = df[df["Disputed"] == 1].copy()
-    if len(disputed) == 0:
-        return {"total": 0, "categories": {}, "items": []}
-    np.random.seed(42)
-    categories = ["Pricing mismatch", "Quantity short", "Quality/damage", "Documentation error", "Duplicate invoice", "Unauthorised deduction"]
-    disputed["Dispute_Category"] = np.random.choice(categories, len(disputed))
-    severity_map = {"Pricing mismatch": "High", "Quantity short": "Medium", "Quality/damage": "High", "Documentation error": "Low", "Duplicate invoice": "Low", "Unauthorised deduction": "Medium"}
-    disputed["Severity"] = disputed["Dispute_Category"].map(severity_map)
-    resolution_map = {"Pricing mismatch": "Auto-pull PriceGuard contract rate; issue credit note if delta confirmed", "Quantity short": "Cross-check ShipmentTracker ePOD qty vs order; auto-credit if shortfall verified", "Quality/damage": "Route to quality team; pull ePOD photos; initiate ReturnFlow if confirmed", "Documentation error": "Auto-reissue with DocComplete validation; no revenue impact", "Duplicate invoice": "Auto-void duplicate; update AR immediately", "Unauthorised deduction": "Flag for commercial review; compare against contract terms in PriceGuard"}
-    disputed["AI_Resolution"] = disputed["Dispute_Category"].map(resolution_map)
-    status_choices = ["Auto-Resolved", "Auto-Resolved", "Pending Review", "Escalated"]
-    disputed["Status"] = np.random.choice(status_choices, len(disputed))
-    days_to_resolve = {"Auto-Resolved": np.random.randint(0, 2, len(disputed)), "Pending Review": np.random.randint(2, 7, len(disputed)), "Escalated": np.random.randint(7, 21, len(disputed))}
-    disputed["Est_Days"] = disputed["Status"].apply(lambda s: np.random.choice(days_to_resolve.get(s, [5])))
-    cat_counts = disputed["Dispute_Category"].value_counts().to_dict()
-    items = disputed[["Order_ID", "Customer", "Invoice_Amount_USD", "Dispute_Category", "Severity", "AI_Resolution", "Status", "Est_Days"]].head(12).to_dict("records")
-    auto_rate = round((disputed["Status"] == "Auto-Resolved").mean() * 100, 1)
-    return {"total": len(disputed), "categories": cat_counts, "items": items, "auto_resolve_rate": auto_rate, "avg_days_before": 18, "avg_days_after": round(disputed["Est_Days"].mean(), 1)}
+# calc_dispute_workflow: removed — not used in ForecastIQ demo
 
-def generate_order_ingest_demo(region):
-    """Simulates OrderIngest Hub processing: multi-channel orders parsed by LLM/OCR."""
-    np.random.seed(42)
-    custs = REGION_CUSTOMERS.get(region, REGION_CUSTOMERS["Singapore"])
-    channels = ["Email PDF", "EDI X12", "WhatsApp Image", "Customer Portal", "Fax Scan", "Email (unstructured)"]
-    statuses = ["Auto-Parsed", "Auto-Parsed", "Auto-Parsed", "Human Review", "AI Gap-Fill"]
-    skus = ["SKU-FMCG-001", "SKU-FMCG-002", "SKU-FMCG-003", "SKU-ELEC-001", "SKU-MED-001"]
-    orders = []
-    for i in range(15):
-        ch = random.choice(channels)
-        confidence = random.randint(72, 99) if ch in ["EDI X12", "Customer Portal"] else random.randint(55, 92)
-        status = "Auto-Parsed" if confidence >= 85 else "Human Review" if confidence >= 70 else "AI Gap-Fill"
-        fields_extracted = random.randint(8, 12) if confidence >= 85 else random.randint(5, 8)
-        fields_total = 12
-        missing = [] if fields_extracted >= 11 else random.sample(["Delivery Date", "PO Reference", "Unit Price", "Ship-To Code", "Payment Terms"], min(3, fields_total - fields_extracted))
-        orders.append({
-            "po_id": f"PO-{2024000 + i}",
-            "customer": random.choice(custs),
-            "channel": ch,
-            "sku_count": random.randint(1, 8),
-            "amount_usd": round(random.uniform(3000, 85000), 2),
-            "confidence": confidence,
-            "status": status,
-            "fields_extracted": fields_extracted,
-            "fields_total": fields_total,
-            "missing_fields": missing,
-            "processing_time": f"{random.uniform(0.5, 3.5):.1f}s" if confidence >= 85 else f"{random.uniform(3, 15):.0f}s",
-        })
-    auto = sum(1 for o in orders if o["status"] == "Auto-Parsed")
-    return {"orders": orders, "auto_rate": round(auto / len(orders) * 100, 1), "avg_confidence": round(np.mean([o["confidence"] for o in orders]), 1), "channels_active": len(set(o["channel"] for o in orders))}
+# generate_order_ingest_demo: removed — not used in ForecastIQ demo
 
-def generate_invoice_demo(df, region):
-    """BillingEngine simulation: auto-invoice trigger on shipment confirmation."""
-    np.random.seed(42)
-    custs = REGION_CUSTOMERS.get(region, REGION_CUSTOMERS["Singapore"])
-    invoices = []
-    for i in range(12):
-        trigger = random.choice(["ePOD Confirmed", "ePOD Confirmed", "ePOD Confirmed", "Milestone Reached", "Consignment Threshold"])
-        val_checks = ["Qty vs ePOD", "Price vs PriceGuard", "Tax compliance", "Doc requirements"]
-        passed = random.sample(val_checks, k=random.randint(3, 4))
-        failed = [c for c in val_checks if c not in passed]
-        status = "Auto-Generated" if len(failed) == 0 else "Validation Hold"
-        invoices.append({
-            "invoice_id": f"INV-{2024100 + i}",
-            "order_id": f"ORD-{1000 + i}",
-            "customer": random.choice(custs),
-            "amount_usd": round(random.uniform(5000, 75000), 2),
-            "trigger": trigger,
-            "checks_passed": passed,
-            "checks_failed": failed,
-            "status": status,
-            "time_to_invoice": f"{random.uniform(0.1, 0.8):.1f} hrs" if status == "Auto-Generated" else f"{random.uniform(2, 24):.0f} hrs (manual review)",
-            "before_time": f"{random.uniform(24, 96):.0f} hrs (manual process)"
-        })
-    auto = sum(1 for inv in invoices if inv["status"] == "Auto-Generated")
-    return {"invoices": invoices, "auto_rate": round(auto / len(invoices) * 100, 1), "avg_time_after": round(np.mean([0.5 if inv["status"] == "Auto-Generated" else 12 for inv in invoices]), 1), "avg_time_before": 48}
+# generate_invoice_demo: removed — not used in ForecastIQ demo
 
 def get_diag_scores(resp):
     sc={}
     for mod,qs in DIAGNOSTIC.items(): vals=[(resp.get(q["key"],0)+1)*25 for q in qs]; sc[mod]=round(sum(vals)/len(vals)) if vals else 50
     return sc
 
-def get_executive_ai(dm,om,fl,bl,ps,ms,diag,region,industry,ccy):
-    p=f"""Revenue Optimizer AI for {industry} in {region}. Currency: {ccy}. MODULE SCORES: {json.dumps(ms)}
-DEMAND: Accuracy {dm['accuracy']}%, MAPE {dm['mape']}%, Bias {dm['bias']:+.1f}%, OTIF {dm['otif']}%
-ORDER: Cycle {om['cycle']}d, Errors {om['err']}%, Disputes {om['disp']}%, Amendments {om['amend']}%
-FULFILMENT: OTIF {fl['otif']}% (bench {fl['otif_bench']}%), Returns {fl['return_rate']}%
-BILLING: DSO {bl['dso']}d (bench {bl['bench']}d), Leakage USD {bl['leak_total']:,.0f}
-POST-SALES: CCC {ps['ccc']}d (bench {ps['bench']}d), Score {ps['score']}/100, AR>90d: {ps['aging']['90d']}%
-MATURITY: {json.dumps(diag)}
-Context: SEA CPG mid-market. Pain: non-binding forecasts, spreadsheet dependence, portal failures, manual rebates.
-For each risk, include a 'why' field: 1 sentence explaining why this severity was assigned based on the data.
-Return ONLY valid JSON: {{"overall_health":"Good|At Risk|Critical","health_score":<int>,"health_reason":"1 sentence explaining the score based on data",
-"executive_summary":"3-4 sentence summary","top_risks":[{{"risk":"...","severity":"High|Medium|Low","impact":"...","module":"...","why":"1 sentence data-based reason for this severity"}}],
-"quick_wins":[{{"action":"...","timeline":"...","expected_impact":"...","module":"..."}}],"forecast_insight":"...","o2c_insight":"...","wc_insight":"..."}}"""
-    r=client.models.generate_content(model=MODEL,contents=p); t=r.text.strip().lstrip("```json").lstrip("```").rstrip("```").strip(); return json.loads(t)
+# get_executive_ai: removed — not used in ForecastIQ demo
 
-def get_agent_simulation(dm,om,fl,bl,ps,ms,region,industry,ccy):
-    p=f"""Revenue Optimizer AI agent for {industry} in {region}. Currency: {ccy}. Simulate 8 realistic interventions over 30 days.
-DATA: Accuracy:{dm['accuracy']}%, OTIF:{dm['otif']}%, Cycle:{om['cycle']}d, Amendments:{om['amend']}%, Errors:{om['err']}%, OTIF:{fl['otif']}%, Returns:{fl['return_rate']}%, DSO:{bl['dso']}d(bench{bl['bench']}d), Leakage:USD{bl['leak_total']:,.0f}, CCC:{ps['ccc']}d, AR>90d:{ps['aging']['90d']}%
-Return ONLY valid JSON: {{"interventions":[{{"day":1,"module":"...","severity":"High|Medium|Low","trigger":"...","action":"...","impact":"..."}}]}}"""
-    r=client.models.generate_content(model=MODEL,contents=p); t=r.text.strip().lstrip("```json").lstrip("```").rstrip("```").strip(); return json.loads(t)
+# get_agent_simulation: removed — not used in ForecastIQ demo
+
 
 def get_demand_signals_ai(region,industry,news,wb,gt):
     nt="\n".join([f"- [{a['source']}] {a['title']}" for a in news[:8]]) or "None."
@@ -748,20 +598,13 @@ with tabs[0]:
                 region=st.session_state.region; industry=st.session_state.industry; ccy=st.session_state.display_ccy
                 inv_d=st.session_state.inv_days; dpo_d=st.session_state.dpo_days; ds=get_diag_scores(st.session_state.diag_responses)
                 with st.spinner("Computing..."): st.session_state.dm=calc_demand(st.session_state.fc_df); st.session_state.om=calc_order_mgmt(st.session_state.o2c_df); st.session_state.fl=calc_fulfilment(st.session_state.o2c_df,industry); st.session_state.bl=calc_billing(st.session_state.o2c_df,industry); st.session_state.ps=calc_post_sales(st.session_state.o2c_df,industry,inv_d,dpo_d); st.session_state.mod_scores=calc_module_scores(st.session_state.dm,st.session_state.om,st.session_state.fl,st.session_state.bl,st.session_state.ps,ds)
-                with st.spinner("LTV & Cash App..."): st.session_state.ltv=calc_customer_ltv(st.session_state.o2c_df,industry); st.session_state.cash_app=calc_cash_app_simulation(st.session_state.o2c_df); st.session_state.disputes=calc_dispute_workflow(st.session_state.o2c_df); st.session_state.order_ingest=generate_order_ingest_demo(region); st.session_state.invoice_demo=generate_invoice_demo(st.session_state.o2c_df,region)
                 yearly={}
                 for yr in get_demand_years(st.session_state.fc_df)[1:]:
-                    fd=filter_demand_by_year(st.session_state.fc_df,yr); od=filter_by_year(st.session_state.o2c_df,yr)
-                    if len(fd)>0 and len(od)>0:
-                        yd=calc_demand(fd); yo=calc_order_mgmt(od); yf=calc_fulfilment(od,industry); yb=calc_billing(od,industry); yp=calc_post_sales(od,industry,inv_d,dpo_d)
-                        yearly[yr]={"accuracy":yd["accuracy"],"mape":yd["mape"],"bias":yd["bias"],"otif":yd["otif"],"dso":yb["dso"],"err":yo["err"],"disp":yo["disp"],"leakage_pct":round((yb["leak_total"]/max(yb["rev"],1))*100,1),"ccc":yp["ccc"],"score":yp["score"],"rev":yb["rev"]}
+                    fd=filter_demand_by_year(st.session_state.fc_df,yr)
+                    if len(fd)>0:
+                        yd=calc_demand(fd)
+                        yearly[yr]={"accuracy":yd["accuracy"],"mape":yd["mape"],"bias":yd["bias"],"otif":yd["otif"]}
                 st.session_state.yearly_metrics=yearly
-                with st.spinner("AI insights..."):
-                    try: st.session_state.ai_exec=get_executive_ai(st.session_state.dm,st.session_state.om,st.session_state.fl,st.session_state.bl,st.session_state.ps,st.session_state.mod_scores,ds,region,industry,ccy)
-                    except: pass
-                with st.spinner("Agent simulation..."):
-                    try: st.session_state.ai_agents=get_agent_simulation(st.session_state.dm,st.session_state.om,st.session_state.fl,st.session_state.bl,st.session_state.ps,st.session_state.mod_scores,region,industry,ccy)
-                    except: pass
                 with st.spinner("Fetching market signals..."):
                     try: st.session_state.news=fetch_news(region,industry)
                     except: pass
@@ -781,21 +624,17 @@ with tabs[0]:
 # ==================== TAB 1: EXECUTIVE HEALTH REPORT ====================
 with tabs[1]:
     st.markdown("""
-    <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:400px;text-align:center">
-        <div style="font-size:3rem;margin-bottom:1rem">🔒</div>
-        <div style="font-size:1.3rem;font-weight:700;color:#0c1222;margin-bottom:0.5rem">Coming Soon</div>
-        <div style="font-size:0.92rem;color:#64748b;max-width:500px;line-height:1.6">This module is part of the full Revenue Optimizer platform. Contact Normality Technologies for a complete platform demonstration and deployment proposal.</div>
-        <div style="margin-top:1.5rem;background:linear-gradient(135deg,#0c1222,#1a2a52);color:white;padding:10px 24px;border-radius:10px;font-size:0.85rem;font-weight:600">Request Full Demo →</div>
+    <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:300px;text-align:center">
+        <div style="font-size:2.5rem;margin-bottom:0.75rem">🔧</div>
+        <div style="font-size:1.1rem;font-weight:600;color:#475569">Under Development</div>
     </div>
     """, unsafe_allow_html=True)
 
 with tabs[3]:
     st.markdown("""
-    <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:400px;text-align:center">
-        <div style="font-size:3rem;margin-bottom:1rem">🔒</div>
-        <div style="font-size:1.3rem;font-weight:700;color:#0c1222;margin-bottom:0.5rem">Coming Soon</div>
-        <div style="font-size:0.92rem;color:#64748b;max-width:500px;line-height:1.6">This module is part of the full Revenue Optimizer platform. Contact Normality Technologies for a complete platform demonstration and deployment proposal.</div>
-        <div style="margin-top:1.5rem;background:linear-gradient(135deg,#0c1222,#1a2a52);color:white;padding:10px 24px;border-radius:10px;font-size:0.85rem;font-weight:600">Request Full Demo →</div>
+    <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:300px;text-align:center">
+        <div style="font-size:2.5rem;margin-bottom:0.75rem">🔧</div>
+        <div style="font-size:1.1rem;font-weight:600;color:#475569">Under Development</div>
     </div>
     """, unsafe_allow_html=True)
 
@@ -1019,21 +858,17 @@ with tabs[2]:
 
 with tabs[4]:
     st.markdown("""
-    <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:400px;text-align:center">
-        <div style="font-size:3rem;margin-bottom:1rem">🔒</div>
-        <div style="font-size:1.3rem;font-weight:700;color:#0c1222;margin-bottom:0.5rem">Coming Soon</div>
-        <div style="font-size:0.92rem;color:#64748b;max-width:500px;line-height:1.6">This module is part of the full Revenue Optimizer platform. Contact Normality Technologies for a complete platform demonstration and deployment proposal.</div>
-        <div style="margin-top:1.5rem;background:linear-gradient(135deg,#0c1222,#1a2a52);color:white;padding:10px 24px;border-radius:10px;font-size:0.85rem;font-weight:600">Request Full Demo →</div>
+    <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:300px;text-align:center">
+        <div style="font-size:2.5rem;margin-bottom:0.75rem">🔧</div>
+        <div style="font-size:1.1rem;font-weight:600;color:#475569">Under Development</div>
     </div>
     """, unsafe_allow_html=True)
 
 with tabs[5]:
     st.markdown("""
-    <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:400px;text-align:center">
-        <div style="font-size:3rem;margin-bottom:1rem">🔒</div>
-        <div style="font-size:1.3rem;font-weight:700;color:#0c1222;margin-bottom:0.5rem">Coming Soon</div>
-        <div style="font-size:0.92rem;color:#64748b;max-width:500px;line-height:1.6">This module is part of the full Revenue Optimizer platform. Contact Normality Technologies for a complete platform demonstration and deployment proposal.</div>
-        <div style="margin-top:1.5rem;background:linear-gradient(135deg,#0c1222,#1a2a52);color:white;padding:10px 24px;border-radius:10px;font-size:0.85rem;font-weight:600">Request Full Demo →</div>
+    <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:300px;text-align:center">
+        <div style="font-size:2.5rem;margin-bottom:0.75rem">🔧</div>
+        <div style="font-size:1.1rem;font-weight:600;color:#475569">Under Development</div>
     </div>
     """, unsafe_allow_html=True)
 
