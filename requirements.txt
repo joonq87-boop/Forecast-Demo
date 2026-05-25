@@ -1,1 +1,8 @@
 streamlit
+pandas
+numpy
+altair
+feedparser
+google-generativeai
+pytrends
+requests
