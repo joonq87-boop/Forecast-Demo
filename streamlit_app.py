@@ -697,12 +697,7 @@ with tabs[2]:
                 st.markdown(f'<div style="margin-bottom:1rem"><div style="display:flex;justify-content:space-between;font-size:0.85rem;margin-bottom:3px"><span style="font-weight:500">{row["SKU"]}</span><span style="color:{c};font-family:JetBrains Mono,monospace;font-weight:500">{row["Accuracy"]}%</span></div><div class="progress-bar-bg"><div class="progress-bar-fill" style="width:{min(100,row["Accuracy"])}%;background:{c}"></div></div><div style="font-size:0.75rem;color:#94a3b8;margin-top:3px">MAPE: {row["MAPE"]}% Bias: {row["Bias"]:+.1f}%</div></div>',unsafe_allow_html=True)
             st.markdown("</div>",unsafe_allow_html=True)
         with cr2:
-            if st.session_state.market_fetched and st.session_state.market_ai:
-                demand_sigs = st.session_state.market_ai.get("demand_signals",[])
-            else:
-                demand_sigs = []
-            if not demand_sigs:
-                demand_sigs = [
+            demand_sigs = [
                     {"signal":"CNY 2026 post-seasonal demand normalisation — expect 8-12% volume decline in March-April as pantry destock takes effect","source":"Historical seasonality analysis / 2023-2025 SPAN data","impact":"Temporary demand dip across staple SKUs in Q2 2026","forecast_adjustment":"Reduce Mar-Apr forecast by 8-10% for staple SKUs; maintain promotional SKUs"},
                     {"signal":"Singapore food services sector projected 4.8% growth in 2026 — restaurant and catering channel expanding faster than retail","source":"Enterprise Singapore Economic Survey Q1 2026 / SingStat","impact":"Sustained demand growth for food service pack sizes; potential channel mix shift","forecast_adjustment":"Increase food service SKU forecasts by 4-5% for H2 2026"},
                     {"signal":"Palm oil futures up 14% YTD (May 2026) — packaging resin costs following at +9%. Input cost pressure building across SEA F&B","source":"Bursa Malaysia Palm Oil Index / ICIS Packaging Report May 2026","impact":"Margin compression may trigger customer down-trading to smaller pack sizes","forecast_adjustment":"Model 5-8% mix shift toward smaller packs; review pricing pass-through timing"},
